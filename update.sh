@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
+source <(curl -fsSL https://raw.githubusercontent.com/vhsdream/ProxmoxVE/refs/heads/grimmory-dev/misc/build.func)
 # Copyright (c) 2021-2026 community-scripts ORG
-# Author: MickLesk (CanbiZ)
+# Author: MickLesk (CanbiZ) | jferdom | vhsdream
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 # Source: https://github.com/grimmory-tools/grimmory
-# Modified by dalenjohnson. Forked by databoy2k for Grimmory 3.x
 
 APP="Grimmory"
 var_tags="${var_tags:-books;library}"
@@ -20,242 +19,129 @@ variables
 color
 catch_errors
 
-function setup_kepubify() {
-  local OLD_PATH="/opt/booklore_storage/data/tools/kepubify"
-  local NEW_PATH="/usr/local/bin/kepubify"
-  local ARCH
-  local URL
-
-  ARCH="$(dpkg --print-architecture)"
-  case "$ARCH" in
-    amd64) URL="https://github.com/pgaskin/kepubify/releases/latest/download/kepubify-linux-64bit" ;;
-    arm64) URL="https://github.com/pgaskin/kepubify/releases/latest/download/kepubify-linux-arm64" ;;
-    *)
-      msg_error "Unsupported architecture: $ARCH"
-      return 1
-      ;;
-  esac
-
-  mkdir -p /usr/local/bin
-
-  # Fail clearly if a previous bad install created a directory here
-  if [[ -d "$NEW_PATH" ]]; then
-    msg_error "Invalid kepubify install detected at $NEW_PATH. It is a directory, not a binary."
-    return 1
-  fi
-
-  # Migrate from old location if present and valid
-  if [[ -f "$OLD_PATH" && -x "$OLD_PATH" && ! -f "$NEW_PATH" ]]; then
-    if "$OLD_PATH" --help >/dev/null 2>&1; then
-      msg_info "Migrating kepubify to /usr/local/bin"
-      mv "$OLD_PATH" "$NEW_PATH"
-      chmod 0755 "$NEW_PATH"
-    else
-      msg_warn "Skipping migration: invalid kepubify binary at $OLD_PATH"
-    fi
-  fi
-
-  # If not installed → ask user
-  if [[ -f "$NEW_PATH" ]]; then
-    msg_info "Updating Kepubify"
-  else
-    if command -v whiptail >/dev/null 2>&1; then
-      if ! whiptail \
-        --backtitle "Proxmox VE Helper Scripts" \
-        --title "KEPUBIFY" \
-        --yesno "Kepubify not found.\n\nInstall it for Kobo Sync support?" 10 60; then
-        msg_info "Skipping Kepubify"
-        return 0
-      fi
-    else
-      read -r -p "Kepubify not found. Install it? [y/N]: " reply
-      [[ "$reply" =~ ^[Yy]$ ]] || return 0
-    fi
-    msg_info "Installing Kepubify"
-  fi
-
-  # Download latest
-  if ! wget -q "$URL" -O /tmp/kepubify; then
-    msg_error "Failed to download Kepubify"
-    return 1
-  fi
-
-  # Install
-  if ! install -m 0755 -T /tmp/kepubify "$NEW_PATH"; then
-    rm -f /tmp/kepubify
-    msg_error "Failed to install Kepubify"
-    return 1
-  fi
-
-  rm -f /tmp/kepubify
-
-  if [[ ! -f "$NEW_PATH" || ! -x "$NEW_PATH" ]]; then
-    msg_error "Kepubify install verification failed: binary missing or not executable"
-    return 1
-  fi
-
-  if ! command -v kepubify >/dev/null 2>&1; then
-    msg_error "Kepubify install verification failed: not found in PATH"
-    return 1
-  fi
-
-  msg_ok "Kepubify ready"
-}
-
 function update_script() {
   header_info
   check_container_storage
   check_container_resources
 
-  # Installation check (Bypassed for repair):
-  # if [[ ! -d /opt/booklore && ! -d /opt/grimmory ]]; then
-  #   msg_error "No BookLore or ${APP} Installation Found!"
-  #   exit
-  # fi
-
-  # --- FORCE REINSTALL ENABLED ---
-  JAVA_VERSION="25"
-  setup_java
-  NODE_VERSION="22"
-  setup_nodejs
-  setup_mariadb
-  setup_yq
-  ensure_dependencies ffmpeg libarchive13
-  setup_kepubify
-  
-  # Confirm libarchive symlink
-  if [[ ! -L /usr/lib/libarchive.so ]]; then
-    ln -s /lib/x86_64-linux-gnu/libarchive.so /usr/lib/
+  if [[ ! -d /opt/booklore ]]; then
+    if [[ ! -d /opt/grimmory ]]; then
+      msg_error "No BookLore or ${APP} Installation Found!"
+      exit
+    fi
   fi
 
-  # Service stop:
-  msg_info "Stopping Service"
-  if [[ -d /opt/grimmory ]]; then
-    systemctl stop grimmory || true
-  else
-    systemctl stop booklore || true
+  if check_for_gh_release "grimmory" "grimmory-tools/grimmory"; then
+    JAVA_VERSION="25" setup_java
+    setup_mariadb
+    setup_yq
+    ensure_dependencies ffmpeg
+
+    msg_info "Stopping Service"
+    if [[ -d /opt/grimmory ]]; then
+      systemctl stop grimmory
+    else
+      systemctl stop booklore
+    fi
+    msg_ok "Stopped Service"
+
+    if [[ -d /opt/booklore ]]; then
+      msg_warn "Migrating booklore to grimmory"
+    fi
+
+    if grep -qE "^BOOKLORE_(DATA_PATH|BOOKDROP_PATH|BOOKS_PATH|PORT)=" /opt/booklore_storage/.env 2>/dev/null; then
+      msg_info "Migrating old environment variables"
+      sed -i -e 's/^BOOKLORE_DATA_PATH=/APP_PATH_CONFIG=/g' \
+        -e 's/^BOOKLORE_BOOKDROP_PATH=/APP_BOOKDROP_FOLDER=/g' \
+        -e '/^BOOKLORE_BOOKS_PATH=/d' \
+        -e '/^BOOKLORE_PORT=/d' /opt/booklore_storage/.env
+      msg_ok "Migrated old environment variables"
+    fi
+
+    msg_info "Backing up old installation"
+    if [[ -d /opt/grimmory ]]; then
+      mv /opt/grimmory /opt/grimmory_bak
+    else
+      mv /opt/booklore /opt/booklore_bak
+    fi
+    msg_ok "Backed up old installation"
+
+    CLEAN_INSTALL=1 fetch_and_deploy_gh_release "grimmory" "grimmory-tools/grimmory" "singlefile" "latest" "/opt/grimmory/dist" "grimmory-v*.jar"
+    mv /opt/grimmory/dist/grimmory /opt/grimmory/dist/app.jar
+
+    if [[ -f /opt/booklore_storage/data/tools/kepubify/kepubify-linux-64bit ]]; then
+      msg_info "Migrating Kepubify to /usr/local/bin"
+      mv /opt/booklore_storage/data/tools/kepubify/kepubify-linux-64bit /usr/local/bin/kepubify
+      msg_ok "Migrated Kepubify to /usr/local/bin"
+    fi
+
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+      msg_info "Removing Nginx (no longer needed)"
+      systemctl disable --now nginx
+      $STD apt-get purge -y nginx nginx-common
+      msg_ok "Removed Nginx"
+    fi
+
+    if [[ -f /etc/apt/sources.list.d/nodesource.sources ]]; then
+      msg_info "Removing NodeJS (no longer needed)"
+      $STD apt-get purge -y nodejs
+      msg_ok "Removed NodeJS"
+    fi
+
+    if ! grep -q "^SERVER_PORT=" /opt/booklore_storage/.env 2>/dev/null; then
+      echo "SERVER_PORT=6060" >>/opt/booklore_storage/.env
+    fi
+
+    if ! grep -q "JAVA_TOOL" /opt/booklore_storage/.env; then
+      {
+        echo ""
+        echo 'JAVA_TOOL_OPTIONS="-XX:+UseShenandoahGC \
+          -XX:ShenandoahGCHeuristics=compact \
+          -XX:+UseCompactObjectHeaders \
+          -XX:MaxRAMPercentage=60.0 \
+          -XX:InitialRAMPercentage=8.0 \
+          -XX:+ExitOnOutOfMemoryError \
+          -XX:+HeapDumpOnOutOfMemoryError \
+          -XX:HeapDumpPath=/tmp/heapdump.hprof \
+          -XX:MaxMetaspaceSize=256m \
+          -XX:ReservedCodeCacheSize=48m \
+          -Xss512k \
+          -XX:CICompilerCount=2 \
+          -XX:+UnlockExperimentalVMOptions \
+          -XX:+UseStringDeduplication \
+          -XX:ShenandoahUncommitDelay=5000 \
+          -XX:ShenandoahGuaranteedGCInterval=30000 \
+          -XX:MaxDirectMemorySize=256m"'
+      } >>/opt/booklore_storage/.env
+    fi
+
+    if test -f /etc/systemd/system/booklore.service; then
+      mv /etc/systemd/system/booklore.service /etc/systemd/system/grimmory.service
+      sed -i -e 's|WorkingDirectory=.*|WorkingDirectory=/opt/grimmory/dist|' \
+        -e '\|dist$|a EnvironmentFile=/opt/booklore_storage/.env' \
+        -e 's|ExecStart=.*|ExecStart=/usr/bin/java --enable-native-access=ALL-UNNAMED --enable-preview -jar /opt/grimmory/dist/app.jar|' /etc/systemd/system/grimmory.service
+      systemctl daemon-reload
+      systemctl -q enable grimmory
+    fi
+
+    msg_info "Starting Service"
+    systemctl start grimmory
+    if [[ -d /opt/grimmory_bak ]]; then
+      rm -rf /opt/grimmory_bak
+    fi
+
+    if [[ -d /opt/booklore_bak ]]; then
+      rm -rf /opt/booklore_bak
+    fi
+    msg_ok "Started Service"
+    msg_ok "Updated successfully!"
   fi
-  msg_ok "Stopped Service"
-
-  # Env var migration:
-  if grep -qE "^BOOKLORE_(DATA_PATH|BOOKDROP_PATH|BOOKS_PATH|PORT)=" /opt/booklore_storage/.env 2>/dev/null; then
-    msg_info "Migrating old environment variables"
-    sed -i 's/^BOOKLORE_DATA_PATH=/APP_PATH_CONFIG=/g' /opt/booklore_storage/.env
-    sed -i 's/^BOOKLORE_BOOKDROP_PATH=/APP_BOOKDROP_FOLDER=/g' /opt/booklore_storage/.env
-    sed -i '/^BOOKLORE_BOOKS_PATH=/d' /opt/booklore_storage/.env
-    sed -i '/^BOOKLORE_PORT=/d' /opt/booklore_storage/.env
-    msg_ok "Migrated old environment variables"
-  fi
-
-  # Backup:
-  msg_info "Backing up old installation"
-  rm -rf /opt/grimmory_bak /opt/booklore_bak
-  if [[ -d /opt/booklore ]]; then
-    mv /opt/booklore /opt/booklore_bak
-  elif [[ -d /opt/grimmory ]]; then
-    cp -a /opt/grimmory /opt/grimmory_bak
-  fi
-  msg_ok "Backed up old installation"
-
-  # Wipe existing grimmory dir before fresh deploy
-  msg_info "Downloading fresh source code"
-  rm -rf /opt/grimmory
-  mkdir -p /opt/grimmory
-  
-  # Manually fetch the tarball to bypass "up-to-date" check in the helper function
-  TARBALL_URL="https://github.com/grimmory-tools/grimmory/tarball/main"
-  curl -fsSL "$TARBALL_URL" -o /tmp/grimmory.tar.gz
-  tar -xzf /tmp/grimmory.tar.gz -C /opt/grimmory --strip-components=1
-  rm -f /tmp/grimmory.tar.gz
-
-  # Frontend build:
-  msg_info "Building Frontend"
-  if [[ ! -d /opt/grimmory/frontend ]]; then
-    msg_error "Source directory /opt/grimmory/frontend does not exist after download!"
-    exit 1
-  fi
-  cd /opt/grimmory/frontend || exit 1
-  
-  # --- FIX: ChartJS Matrix Resolution & Stability ---
-  rm -rf node_modules package-lock.json
-  npm cache clean --force
-  
-  msg_info "Ensuring ChartJS Matrix stability (v2.1.1)..."
-  npm install chartjs-chart-matrix@2.1.1 --save-exact --no-audit --no-fund
-  
-  if [[ ! -f "node_modules/chartjs-chart-matrix/dist/chartjs-chart-matrix.esm.js" ]]; then
-    msg_error "CRITICAL: Required chartjs-chart-matrix file not found after install."
-    return 1
-  fi
-  # ---------------------------------------------------
-
-  npm run build --configuration=production
-  msg_ok "Built Frontend"
-
-  # Backend build:
-  msg_info "Building Backend"
-  cd /opt/grimmory/backend || exit 1
-  APP_VERSION=$(get_latest_github_release "grimmory-tools/grimmory")
-  $STD yq eval ".app.version = \"${APP_VERSION}\"" -i src/main/resources/application.yaml
-  $STD ./gradlew clean bootJar -PfrontendDistDir=/opt/grimmory/frontend/dist/grimmory/browser -x test --no-daemon
-
-  mkdir -p /opt/grimmory/dist
-  JAR_PATH=$(find /opt/grimmory/backend/build/libs -maxdepth 1 -type f -name "*.jar" ! -name "*plain*" | head -n1)
-  if [[ -z "$JAR_PATH" ]]; then
-    msg_error "Backend JAR not found"
-    exit
-  fi
-  cp "$JAR_PATH" /opt/grimmory/dist/app.jar
-  msg_ok "Built Backend"
-
-  # Nginx removal:
-  if systemctl is-active --quiet nginx 2>/dev/null; then
-    msg_info "Removing Nginx (no longer needed)"
-    systemctl disable --now nginx >/dev/null 2>&1 || true
-    $STD apt-get purge -y nginx nginx-common
-    msg_ok "Removed Nginx"
-  fi
-
-  # SERVER_PORT injection:
-  if ! grep -q "^SERVER_PORT=" /opt/booklore_storage/.env 2>/dev/null; then
-    echo "SERVER_PORT=6060" >> /opt/booklore_storage/.env
-  fi
-
-  if [[ -f /etc/systemd/system/booklore.service && ! -f /etc/systemd/system/grimmory.service ]]; then
-    mv /etc/systemd/system/booklore.service /etc/systemd/system/grimmory.service
-  fi
-
-  # Service file migration:
-  if [[ ! -f /etc/systemd/system/grimmory.service ]]; then
-    msg_error "grimmory.service not found"
-    exit
-  fi
-
-  sed -i 's|WorkingDirectory=.*|WorkingDirectory=/opt/grimmory/dist|' /etc/systemd/system/grimmory.service
-  sed -i 's|ExecStart=.*|ExecStart=/usr/bin/java --enable-preview -XX:+UseG1GC -XX:+UseStringDeduplication -XX:+UseCompactObjectHeaders -XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError -jar /opt/grimmory/dist/app.jar|' /etc/systemd/system/grimmory.service
-  systemctl daemon-reload
-  systemctl disable --now booklore.service >/dev/null 2>&1 || true
-
-  # Start + cleanup:
-  msg_info "Starting Service"
-  systemctl enable --now grimmory.service
-
-  sleep 2
-  if ! systemctl is-active --quiet grimmory.service; then
-    msg_error "Grimmory service failed to start. Backups were retained."
-    exit 1
-  fi
-
-  rm -rf /opt/grimmory_bak /opt/booklore_bak
-  msg_ok "Started Service"
-  msg_ok "Updated successfully!"
   exit
 }
 
 start
 build_container
 description
-update_script "$@"
 
 msg_ok "Completed successfully!\n"
 echo -e "${CREATING}${GN}${APP} setup has been successfully initialized!${CL}"
