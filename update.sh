@@ -9,9 +9,22 @@ source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxV
 # Modified by originalme8. Forked by originalme8
 
 APP="Grimmory"
+
+echo "APP == $APP"
 REPO="grimmory-tools/grimmory"
+
+echo "REPO == $REPO"
 # Move to beginign of script, does this break anything, or fix the version number?
-APP_VERSION=$(get_latest_github_release "grimmory-tools/grimmory")
+APP_VERSION=$(get_latest_github_release "$REPO")
+
+
+
+export APP_VERSION
+
+echo "APP Version == $APP_VERSION"
+
+exit
+
 var_tags="${var_tags:-books;library}"
 var_cpu="${var_cpu:-3}"
 var_ram="${var_ram:-3072}"
