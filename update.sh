@@ -11,7 +11,7 @@ source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxV
 APP="Grimmory"
 REPO="grimmory-tools/grimmory"
 # Move to beginign of script, does this break anything, or fix the version number?
-APP_VERSION=$(get_latest_github_release "$REPO")
+APP_VERSION=$(get_latest_github_release "grimmory-tools/grimmory")
 var_tags="${var_tags:-books;library}"
 var_cpu="${var_cpu:-3}"
 var_ram="${var_ram:-3072}"
