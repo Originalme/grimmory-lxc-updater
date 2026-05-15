@@ -252,6 +252,8 @@ function update_script() {
   exit
 }
 
+# Move to beginign of script, does this break anything, or fix the version number?
+APP_VERSION=$(get_latest_github_release "grimmory-tools/grimmory")
 start
 build_container
 description
