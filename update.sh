@@ -5,8 +5,12 @@ source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxV
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 # Source: https://github.com/grimmory-tools/grimmory
 # Modified by dalenjohnson. Forked by databoy2k for Grimmory 3.x
+# Modified by originalme8. Forked by originalme8
 
 APP="Grimmory"
+REPO="grimmory-tools/grimmory"
+# Move to beginign of script, does this break anything, or fix the version number?
+APP_VERSION=$(get_latest_github_release "$REPO")
 var_tags="${var_tags:-books;library}"
 var_cpu="${var_cpu:-3}"
 var_ram="${var_ram:-3072}"
@@ -195,7 +199,7 @@ function update_script() {
   # Backend build:
   msg_info "Building Backend"
   cd /opt/grimmory/backend || exit 1
-  APP_VERSION=$(get_latest_github_release "grimmory-tools/grimmory")
+  #APP_VERSION=$(get_latest_github_release "$REPO") # Removing for testing puproses, moved to top of script
   $STD yq eval ".app.version = \"${APP_VERSION}\"" -i src/main/resources/application.yaml
   $STD ./gradlew clean bootJar -PfrontendDistDir=/opt/grimmory/frontend/dist/grimmory/browser -x test --no-daemon
 
@@ -252,8 +256,7 @@ function update_script() {
   exit
 }
 
-# Move to beginign of script, does this break anything, or fix the version number?
-APP_VERSION=$(get_latest_github_release "grimmory-tools/grimmory")
+
 start
 build_container
 description
