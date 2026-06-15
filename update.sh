@@ -5,12 +5,14 @@ source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxV
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 # Source: https://github.com/grimmory-tools/grimmory
 # Modified by dalenjohnson. Forked by databoy2k for Grimmory 3.x
+# Modified for Grimmory release JAR deployments inside LXC.
+# Supports both historical versioned assets (grimmory-vX.Y.Z.jar) and current generic assets (grimmory.jar).
 
 APP="Grimmory"
 var_tags="${var_tags:-books;library}"
 var_cpu="${var_cpu:-3}"
-var_ram="${var_ram:-6144}"
-var_disk="${var_disk:-10}"
+var_ram="${var_ram:-3072}"
+var_disk="${var_disk:-7}"
 var_os="${var_os:-debian}"
 var_version="${var_version:-13}"
 var_unprivileged="${var_unprivileged:-1}"
@@ -20,10 +22,13 @@ variables
 color
 catch_errors
 
-
 function normalize_grimmory_release() {
-  local release
-  release="$(get_latest_github_release "grimmory-tools/grimmory")"
+  local release="${GRIMMORY_RELEASE:-}"
+
+  if [[ -z "$release" ]]; then
+    release="$(get_latest_github_release "grimmory-tools/grimmory")"
+  fi
+
   release="${release#v}"
 
   if [[ -z "$release" ]]; then
@@ -34,6 +39,33 @@ function normalize_grimmory_release() {
   GRIMMORY_VERSION="v${release}"
   GRIMMORY_VERSION_CLEAN="${release}"
   GRIMMORY_REVISION="unknown"
+}
+
+function build_grimmory_jar_asset_candidates() {
+  local CANDIDATES=()
+  local ASSET
+
+  # Allow manual override for future naming changes, for example:
+  #   GRIMMORY_JAR_ASSET=grimmory.jar bash update_prebuilt_jar.sh
+  if [[ -n "${GRIMMORY_JAR_ASSET:-}" ]]; then
+    CANDIDATES+=("$GRIMMORY_JAR_ASSET")
+  fi
+
+  # Historical release asset names used by Grimmory releases.
+  CANDIDATES+=(
+    "grimmory-${GRIMMORY_VERSION}.jar"
+    "grimmory-${GRIMMORY_VERSION_CLEAN}.jar"
+    "grimmory.jar"
+  )
+
+  # De-duplicate while preserving order.
+  GRIMMORY_JAR_ASSET_CANDIDATES=()
+  for ASSET in "${CANDIDATES[@]}"; do
+    [[ -n "$ASSET" ]] || continue
+    if [[ " ${GRIMMORY_JAR_ASSET_CANDIDATES[*]} " != *" $ASSET "* ]]; then
+      GRIMMORY_JAR_ASSET_CANDIDATES+=("$ASSET")
+    fi
+  done
 }
 
 function setup_libarchive_link() {
@@ -109,68 +141,6 @@ function upsert_service_line() {
   rm -f "$TMP"
 }
 
-
-function run_long_command() {
-  local NAME="$1"
-  shift
-  local LOG_FILE="/tmp/grimmory-${NAME}.log"
-  local PID
-  local RC
-  local OLD_HUP_TRAP
-  local OLD_ERREXIT="off"
-
-  msg_info "Running ${NAME} (log: ${LOG_FILE})"
-  rm -f "$LOG_FILE"
-
-  # community-scripts installs a SIGHUP trap. Angular builds can be quiet for long
-  # stretches, and in some LXC/helper contexts the child process gets HUP'd before
-  # it can print a real build error. Ignore HUP only while this long command runs.
-  OLD_HUP_TRAP="$(trap -p HUP || true)"
-  case "$-" in
-    *e*) OLD_ERREXIT="on" ;;
-  esac
-
-  trap '' HUP
-
-  (
-    trap '' HUP
-    echo "[$(date -Is)] Command: $*"
-    echo "[$(date -Is)] MemTotal: $(awk '/^MemTotal:/ {printf "%d MB", $2/1024}' /proc/meminfo 2>/dev/null || true)"
-    echo "[$(date -Is)] SwapTotal: $(awk '/^SwapTotal:/ {printf "%d MB", $2/1024}' /proc/meminfo 2>/dev/null || true)"
-    echo "[$(date -Is)] Disk free at /opt/grimmory: $(df -h /opt/grimmory 2>/dev/null | awk 'NR==2 {print $4 " free of " $2}' || true)"
-    exec nohup "$@" </dev/null
-  ) >"$LOG_FILE" 2>&1 &
-  PID=$!
-
-  while kill -0 "$PID" >/dev/null 2>&1; do
-    sleep 15
-    echo -n "."
-  done
-  echo
-
-  # Do not let set -e / ERR trap short-circuit our log printing.
-  set +e
-  wait "$PID"
-  RC=$?
-  if [[ "$OLD_ERREXIT" == "on" ]]; then
-    set -e
-  fi
-
-  if [[ -n "$OLD_HUP_TRAP" ]]; then
-    eval "$OLD_HUP_TRAP"
-  else
-    trap - HUP
-  fi
-
-  if [[ "$RC" -ne 0 ]]; then
-    msg_warn "${NAME} failed with exit code ${RC}; showing the last 200 log lines"
-    tail -n 200 "$LOG_FILE" || true
-    return "$RC"
-  fi
-
-  msg_ok "${NAME} completed"
-}
-
 function setup_kepubify() {
   local OLD_PATH="/opt/booklore_storage/data/tools/kepubify"
   local NEW_PATH="/usr/local/bin/kepubify"
@@ -189,13 +159,11 @@ function setup_kepubify() {
 
   mkdir -p /usr/local/bin
 
-  # Fail clearly if a previous bad install created a directory here
   if [[ -d "$NEW_PATH" ]]; then
     msg_error "Invalid kepubify install detected at $NEW_PATH. It is a directory, not a binary."
     return 1
   fi
 
-  # Migrate from old location if present and valid
   if [[ -f "$OLD_PATH" && -x "$OLD_PATH" && ! -f "$NEW_PATH" ]]; then
     if "$OLD_PATH" --help >/dev/null 2>&1; then
       msg_info "Migrating kepubify to /usr/local/bin"
@@ -206,7 +174,6 @@ function setup_kepubify() {
     fi
   fi
 
-  # If not installed → ask user
   if [[ -f "$NEW_PATH" ]]; then
     msg_info "Updating Kepubify"
   else
@@ -225,13 +192,11 @@ function setup_kepubify() {
     msg_info "Installing Kepubify"
   fi
 
-  # Download latest
   if ! wget -q "$URL" -O /tmp/kepubify; then
     msg_error "Failed to download Kepubify"
     return 1
   fi
 
-  # Install
   if ! install -m 0755 -T /tmp/kepubify "$NEW_PATH"; then
     rm -f /tmp/kepubify
     msg_error "Failed to install Kepubify"
@@ -253,36 +218,107 @@ function setup_kepubify() {
   msg_ok "Kepubify ready"
 }
 
+function download_prebuilt_grimmory_jar() {
+  local OUT_FILE="$1"
+  local MIN_SIZE_BYTES=$((50 * 1024 * 1024))
+  local SIZE_BYTES
+  local ASSET
+  local URL
+
+  rm -f "$OUT_FILE"
+  build_grimmory_jar_asset_candidates
+
+  msg_info "Downloading prebuilt Grimmory JAR (${GRIMMORY_VERSION})"
+  for ASSET in "${GRIMMORY_JAR_ASSET_CANDIDATES[@]}"; do
+    URL="https://github.com/grimmory-tools/grimmory/releases/download/${GRIMMORY_VERSION}/${ASSET}"
+    msg_info "Trying release asset: ${ASSET}"
+
+    if curl -fL --retry 3 --retry-delay 2 "$URL" -o "$OUT_FILE"; then
+      GRIMMORY_JAR_ASSET="$ASSET"
+      GRIMMORY_JAR_URL="$URL"
+      msg_ok "Downloaded release asset: ${ASSET}"
+      break
+    fi
+
+    rm -f "$OUT_FILE"
+  done
+
+  if [[ ! -s "$OUT_FILE" ]]; then
+    msg_error "Failed to download a prebuilt Grimmory JAR for ${GRIMMORY_VERSION}. Tried: ${GRIMMORY_JAR_ASSET_CANDIDATES[*]}"
+    return 1
+  fi
+
+  SIZE_BYTES="$(stat -c '%s' "$OUT_FILE")"
+  if (( SIZE_BYTES < MIN_SIZE_BYTES )); then
+    msg_error "Downloaded file is too small to be the Grimmory application JAR (${SIZE_BYTES} bytes)"
+    return 1
+  fi
+
+  if command -v jar >/dev/null 2>&1; then
+    if ! jar tf "$OUT_FILE" >/dev/null 2>&1; then
+      msg_error "Downloaded file is not a valid JAR archive"
+      return 1
+    fi
+  else
+    msg_warn "jar command not found; skipping JAR archive validation"
+  fi
+
+  msg_ok "Prebuilt Grimmory JAR ready (${GRIMMORY_JAR_ASSET})"
+}
+
+function ensure_grimmory_service_exists() {
+  if [[ -f /etc/systemd/system/booklore.service && ! -f /etc/systemd/system/grimmory.service ]]; then
+    mv /etc/systemd/system/booklore.service /etc/systemd/system/grimmory.service
+  fi
+
+  if [[ ! -f /etc/systemd/system/grimmory.service ]]; then
+    msg_info "Creating grimmory.service"
+    cat >/etc/systemd/system/grimmory.service <<'SERVICE_EOF'
+[Unit]
+Description=Grimmory
+After=network-online.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+    msg_ok "Created grimmory.service"
+  fi
+}
+
 function update_script() {
   header_info
   check_container_storage
   check_container_resources
 
-  # Installation check (Bypassed for repair):
+  # Installation check intentionally remains bypassed for repair/update scenarios.
   # if [[ ! -d /opt/booklore && ! -d /opt/grimmory ]]; then
   #   msg_error "No BookLore or ${APP} Installation Found!"
   #   exit
   # fi
 
-  # --- FORCE REINSTALL ENABLED ---
   JAVA_VERSION="25"
   setup_java
-  NODE_VERSION="24"
-  setup_nodejs
   setup_mariadb
-  setup_yq
   ensure_dependencies ffmpeg libarchive13
   setup_kepubify
-  
-  # Grimmory 3.x native archive support expects libarchive.so to resolve.
+
+  # Grimmory native archive support expects libarchive.so to resolve.
   setup_libarchive_link
 
+  local EXISTING_BOOKLORE_PORT
+  local TMP_JAR
   EXISTING_BOOKLORE_PORT="$(grep -E '^BOOKLORE_PORT=' /opt/booklore_storage/.env 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
 
-  # Resolve the release once and use it for download, build metadata, and systemd runtime metadata.
   normalize_grimmory_release
+  TMP_JAR="/tmp/grimmory-${GRIMMORY_VERSION}.jar"
+  download_prebuilt_grimmory_jar "$TMP_JAR"
 
-  # Service stop:
   msg_info "Stopping Service"
   if [[ -d /opt/grimmory ]]; then
     systemctl stop grimmory || true
@@ -291,7 +327,6 @@ function update_script() {
   fi
   msg_ok "Stopped Service"
 
-  # Env var migration:
   if grep -qE "^BOOKLORE_(DATA_PATH|BOOKDROP_PATH|BOOKS_PATH|PORT)=" /opt/booklore_storage/.env 2>/dev/null; then
     msg_info "Migrating old environment variables"
     sed -i 's/^BOOKLORE_DATA_PATH=/APP_PATH_CONFIG=/g' /opt/booklore_storage/.env
@@ -301,92 +336,22 @@ function update_script() {
     msg_ok "Migrated old environment variables"
   fi
 
-  # Backup:
   msg_info "Backing up old installation"
   rm -rf /opt/grimmory_bak /opt/booklore_bak
   if [[ -d /opt/booklore ]]; then
     mv /opt/booklore /opt/booklore_bak
-  elif [[ -d /opt/grimmory ]]; then
+  fi
+  if [[ -d /opt/grimmory ]]; then
     cp -a /opt/grimmory /opt/grimmory_bak
   fi
   msg_ok "Backed up old installation"
 
-  # Wipe existing grimmory dir before fresh deploy
-  msg_info "Downloading fresh source code (${GRIMMORY_VERSION})"
+  msg_info "Installing prebuilt Grimmory JAR (${GRIMMORY_VERSION})"
   rm -rf /opt/grimmory
-  mkdir -p /opt/grimmory
-  
-  # Fetch the latest release tag instead of the moving main/develop branch.
-  TARBALL_URL="https://github.com/grimmory-tools/grimmory/archive/refs/tags/${GRIMMORY_VERSION}.tar.gz"
-  curl -fsSL "$TARBALL_URL" -o /tmp/grimmory.tar.gz
-  tar -xzf /tmp/grimmory.tar.gz -C /opt/grimmory --strip-components=1
-  rm -f /tmp/grimmory.tar.gz
-
-  # Frontend build:
-  msg_info "Building Frontend"
-  if [[ ! -d /opt/grimmory/frontend ]]; then
-    msg_error "Source directory /opt/grimmory/frontend does not exist after download!"
-    exit 1
-  fi
-  cd /opt/grimmory/frontend || exit 1
-  
-  rm -rf node_modules .angular/cache
-  corepack enable
-  $STD corepack prepare yarn@4.10.3 --activate
-
-  # Keep the install/build resilient inside pct/Proxmox helper sessions.
-  # The Dockerfile uses these same CI and Angular analytics flags for production builds.
-  if ! run_long_command frontend-install corepack yarn install --immutable; then
-    msg_error "Frontend dependency install failed. See /tmp/grimmory-frontend-install.log"
-    exit 1
-  fi
-
-  local MEM_MB
-  local NODE_HEAP_MB
-  MEM_MB="$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
-  if [[ "$MEM_MB" =~ ^[0-9]+$ ]] && (( MEM_MB > 0 )); then
-    NODE_HEAP_MB=$((MEM_MB * 55 / 100))
-    (( NODE_HEAP_MB < 2048 )) && NODE_HEAP_MB=2048
-    (( NODE_HEAP_MB > 4096 )) && NODE_HEAP_MB=4096
-  else
-    NODE_HEAP_MB=3072
-  fi
-
-  if [[ "$MEM_MB" =~ ^[0-9]+$ ]] && (( MEM_MB < 4096 )); then
-    msg_warn "Detected only ${MEM_MB} MB RAM. Grimmory 3.2.0 frontend builds may need at least 4 GB; 6 GB is safer."
-  fi
-
-  export NODE_OPTIONS="--max-old-space-size=${NODE_HEAP_MB}"
-  export YARN_ENABLE_TELEMETRY=0
-  export CI=1
-  export NG_CLI_ANALYTICS=false
-  export NG_BUILD_MAX_WORKERS=2
-
-  if ! run_long_command frontend-build corepack yarn ng build --configuration production --progress=false; then
-    msg_error "Frontend build failed. See /tmp/grimmory-frontend-build.log"
-    exit 1
-  fi
-
-  unset CI NG_CLI_ANALYTICS YARN_ENABLE_TELEMETRY NODE_OPTIONS NG_BUILD_MAX_WORKERS
-  msg_ok "Built Frontend"
-
-  # Backend build:
-  msg_info "Building Backend"
-  cd /opt/grimmory/backend || exit 1
-  export APP_VERSION="${GRIMMORY_VERSION}"
-  export APP_REVISION="${GRIMMORY_REVISION}"
-  $STD ./gradlew clean bootJar -PfrontendDistDir=/opt/grimmory/frontend/dist/grimmory/browser -x test --no-daemon
-
   mkdir -p /opt/grimmory/dist
-  JAR_PATH=$(find /opt/grimmory/backend/build/libs -maxdepth 1 -type f -name "*.jar" ! -name "*plain*" | head -n1)
-  if [[ -z "$JAR_PATH" ]]; then
-    msg_error "Backend JAR not found"
-    exit
-  fi
-  cp "$JAR_PATH" /opt/grimmory/dist/app.jar
-  msg_ok "Built Backend"
+  install -m 0644 -T "$TMP_JAR" /opt/grimmory/dist/app.jar
+  msg_ok "Installed prebuilt Grimmory JAR"
 
-  # Nginx removal:
   if systemctl is-active --quiet nginx 2>/dev/null; then
     msg_info "Removing Nginx (no longer needed)"
     systemctl disable --now nginx >/dev/null 2>&1 || true
@@ -397,15 +362,7 @@ function update_script() {
   # Grimmory still reads BOOKLORE_PORT in application.yaml.
   ensure_env_kv /opt/booklore_storage/.env BOOKLORE_PORT "${EXISTING_BOOKLORE_PORT:-6060}"
 
-  if [[ -f /etc/systemd/system/booklore.service && ! -f /etc/systemd/system/grimmory.service ]]; then
-    mv /etc/systemd/system/booklore.service /etc/systemd/system/grimmory.service
-  fi
-
-  # Service file migration:
-  if [[ ! -f /etc/systemd/system/grimmory.service ]]; then
-    msg_error "grimmory.service not found"
-    exit
-  fi
+  ensure_grimmory_service_exists
 
   JAVA_TOOL_OPTIONS="-XX:+UseShenandoahGC -XX:ShenandoahGCHeuristics=compact -XX:+UseCompactObjectHeaders -XX:MaxRAMPercentage=60.0 -XX:InitialRAMPercentage=8.0 -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/heapdump.hprof -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=48m -Xss512k -XX:CICompilerCount=2 -XX:+UnlockExperimentalVMOptions -XX:+UseStringDeduplication -XX:ShenandoahUncommitDelay=5000 -XX:ShenandoahGuaranteedGCInterval=30000 -XX:MaxDirectMemorySize=256m --enable-native-access=ALL-UNNAMED --enable-preview"
 
@@ -422,7 +379,6 @@ function update_script() {
   systemctl daemon-reload
   systemctl disable --now booklore.service >/dev/null 2>&1 || true
 
-  # Start + cleanup:
   msg_info "Starting Service"
   systemctl enable --now grimmory.service
 
@@ -433,9 +389,9 @@ function update_script() {
     exit 1
   fi
 
-  rm -rf /opt/grimmory_bak /opt/booklore_bak
+  rm -rf /opt/grimmory_bak /opt/booklore_bak "$TMP_JAR"
   msg_ok "Started Service"
-  msg_ok "Updated successfully!"
+  msg_ok "Updated successfully using prebuilt JAR!"
   exit
 }
 
