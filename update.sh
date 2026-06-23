@@ -7,12 +7,14 @@ source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxV
 # Modified by dalenjohnson. Forked by databoy2k for Grimmory 3.x
 # Modified for Grimmory release JAR deployments inside LXC.
 # Supports both historical versioned assets (grimmory-vX.Y.Z.jar) and current generic assets (grimmory.jar).
+# Uses runtime-sized LXC defaults because release JAR deployments do not build from source.
+# Optimized to discover release JAR assets via GitHub API, replace the JAR atomically, and rollback on start failure.
 
 APP="Grimmory"
 var_tags="${var_tags:-books;library}"
-var_cpu="${var_cpu:-3}"
-var_ram="${var_ram:-3072}"
-var_disk="${var_disk:-7}"
+var_cpu="${var_cpu:-2}"
+var_ram="${var_ram:-4096}"
+var_disk="${var_disk:-10}"
 var_os="${var_os:-debian}"
 var_version="${var_version:-13}"
 var_unprivileged="${var_unprivileged:-1}"
@@ -68,14 +70,17 @@ function build_grimmory_jar_asset_candidates() {
   done
 }
 
-function setup_libarchive_link() {
+function setup_libarchive_runtime() {
   local LIBARCHIVE_TARGET=""
   local CANDIDATE
+  local GRIMMORY_LIB_DIR="/usr/local/lib/grimmory"
+  local MULTIARCH_DIR=""
 
-  for CANDIDATE in \
-    /usr/lib/*/libarchive.so.13 \
-    /lib/*/libarchive.so.13 \
-    /usr/lib/libarchive.so.13; do
+  if command -v dpkg-architecture >/dev/null 2>&1; then
+    MULTIARCH_DIR="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
+  fi
+
+  for CANDIDATE in     /usr/lib/${MULTIARCH_DIR}/libarchive.so     /lib/${MULTIARCH_DIR}/libarchive.so     /usr/lib/*/libarchive.so     /lib/*/libarchive.so     /usr/lib/${MULTIARCH_DIR}/libarchive.so.13     /lib/${MULTIARCH_DIR}/libarchive.so.13     /usr/lib/*/libarchive.so.13     /lib/*/libarchive.so.13     /usr/lib/libarchive.so     /usr/lib/libarchive.so.13; do
     if [[ -e "$CANDIDATE" ]]; then
       LIBARCHIVE_TARGET="$CANDIDATE"
       break
@@ -83,16 +88,27 @@ function setup_libarchive_link() {
   done
 
   if [[ -z "$LIBARCHIVE_TARGET" ]]; then
-    msg_error "libarchive.so.13 was not found after installing libarchive13"
+    msg_error "libarchive was not found after installing libarchive packages"
     return 1
   fi
 
-  mkdir -p /usr/lib
-  if [[ -e /usr/lib/libarchive.so && ! -L /usr/lib/libarchive.so ]]; then
-    msg_warn "/usr/lib/libarchive.so already exists and is not a symlink; leaving it unchanged"
-  elif [[ ! -e /usr/lib/libarchive.so ]]; then
-    ln -s "$LIBARCHIVE_TARGET" /usr/lib/libarchive.so
+  # Do not write to /usr/lib directly. Some unprivileged or hardened LXCs reject
+  # manual symlink creation there. Put Grimmory's compatibility link in a private
+  # directory and expose it through ldconfig/JNA/LD_LIBRARY_PATH instead.
+  mkdir -p "$GRIMMORY_LIB_DIR"
+  rm -f "$GRIMMORY_LIB_DIR/libarchive.so"
+
+  if ! ln -s "$LIBARCHIVE_TARGET" "$GRIMMORY_LIB_DIR/libarchive.so" 2>/dev/null; then
+    msg_warn "Unable to create libarchive symlink; copying library into ${GRIMMORY_LIB_DIR} instead"
+    cp -fL "$LIBARCHIVE_TARGET" "$GRIMMORY_LIB_DIR/libarchive.so"
+    chmod 0644 "$GRIMMORY_LIB_DIR/libarchive.so"
   fi
+
+  echo "$GRIMMORY_LIB_DIR" >/etc/ld.so.conf.d/grimmory-libarchive.conf
+  ldconfig >/dev/null 2>&1 || true
+
+  GRIMMORY_NATIVE_LIBRARY_PATH="$GRIMMORY_LIB_DIR"
+  msg_ok "libarchive runtime path ready"
 }
 
 function ensure_env_kv() {
@@ -218,17 +234,108 @@ function setup_kepubify() {
   msg_ok "Kepubify ready"
 }
 
-function download_prebuilt_grimmory_jar() {
-  local OUT_FILE="$1"
+function resolve_grimmory_jar_download_url() {
+  local API_URL="https://api.github.com/repos/grimmory-tools/grimmory/releases/tags/${GRIMMORY_VERSION}"
+  local API_JSON=""
+  local ASSET
+  local URL=""
+
+  GRIMMORY_JAR_URL=""
+
+  # Allow a full URL override for emergency/manual testing.
+  # Example: GRIMMORY_JAR_URL_OVERRIDE=https://example.com/grimmory.jar bash update.sh
+  if [[ -n "${GRIMMORY_JAR_URL_OVERRIDE:-}" ]]; then
+    GRIMMORY_JAR_URL="$GRIMMORY_JAR_URL_OVERRIDE"
+    GRIMMORY_JAR_ASSET="$(basename "$GRIMMORY_JAR_URL_OVERRIDE")"
+    return 0
+  fi
+
+  build_grimmory_jar_asset_candidates
+
+  # Prefer the GitHub release API so future asset-name changes do not break updates.
+  if API_JSON="$(curl -fsSL --retry 3 --retry-delay 2 "$API_URL" 2>/dev/null)"; then
+    for ASSET in "${GRIMMORY_JAR_ASSET_CANDIDATES[@]}"; do
+      URL="$(printf '%s\n' "$API_JSON" | awk -v asset="$ASSET" '
+        /"browser_download_url"/ {
+          line=$0
+          gsub(/^[[:space:]]*"browser_download_url":[[:space:]]*"/, "", line)
+          gsub(/",?[[:space:]]*$/, "", line)
+          n=split(line, parts, "/")
+          if (parts[n] == asset) { print line; exit }
+        }
+      ')"
+      if [[ -n "$URL" ]]; then
+        GRIMMORY_JAR_URL="$URL"
+        GRIMMORY_JAR_ASSET="$ASSET"
+        return 0
+      fi
+    done
+
+    # Fallback: use the first JAR asset on the release if it is not one of the known names.
+    URL="$(printf '%s\n' "$API_JSON" | awk '
+      /"browser_download_url"/ {
+        line=$0
+        gsub(/^[[:space:]]*"browser_download_url":[[:space:]]*"/, "", line)
+        gsub(/",?[[:space:]]*$/, "", line)
+        if (line ~ /\.jar$/) { print line; exit }
+      }
+    ')"
+    if [[ -n "$URL" ]]; then
+      GRIMMORY_JAR_URL="$URL"
+      GRIMMORY_JAR_ASSET="$(basename "$URL")"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+function validate_grimmory_jar() {
+  local JAR_FILE="$1"
   local MIN_SIZE_BYTES=$((50 * 1024 * 1024))
   local SIZE_BYTES
+
+  if [[ ! -s "$JAR_FILE" ]]; then
+    msg_error "Downloaded Grimmory JAR is missing or empty"
+    return 1
+  fi
+
+  SIZE_BYTES="$(stat -c '%s' "$JAR_FILE")"
+  if (( SIZE_BYTES < MIN_SIZE_BYTES )); then
+    msg_error "Downloaded file is too small to be the Grimmory application JAR (${SIZE_BYTES} bytes)"
+    return 1
+  fi
+
+  if command -v jar >/dev/null 2>&1; then
+    if ! jar tf "$JAR_FILE" >/dev/null 2>&1; then
+      msg_error "Downloaded file is not a valid JAR archive"
+      return 1
+    fi
+  else
+    msg_warn "jar command not found; skipping JAR archive validation"
+  fi
+}
+
+function download_prebuilt_grimmory_jar() {
+  local OUT_FILE="$1"
   local ASSET
   local URL
 
   rm -f "$OUT_FILE"
-  build_grimmory_jar_asset_candidates
 
-  msg_info "Downloading prebuilt Grimmory JAR (${GRIMMORY_VERSION})"
+  msg_info "Resolving prebuilt Grimmory JAR (${GRIMMORY_VERSION})"
+  if resolve_grimmory_jar_download_url; then
+    msg_info "Downloading release asset: ${GRIMMORY_JAR_ASSET}"
+    if curl -fL --retry 3 --retry-delay 2 "$GRIMMORY_JAR_URL" -o "$OUT_FILE"; then
+      validate_grimmory_jar "$OUT_FILE"
+      msg_ok "Prebuilt Grimmory JAR ready (${GRIMMORY_JAR_ASSET})"
+      return 0
+    fi
+    rm -f "$OUT_FILE"
+    msg_warn "Resolved asset download failed; trying direct release URLs"
+  fi
+
+  build_grimmory_jar_asset_candidates
   for ASSET in "${GRIMMORY_JAR_ASSET_CANDIDATES[@]}"; do
     URL="https://github.com/grimmory-tools/grimmory/releases/download/${GRIMMORY_VERSION}/${ASSET}"
     msg_info "Trying release asset: ${ASSET}"
@@ -236,34 +343,16 @@ function download_prebuilt_grimmory_jar() {
     if curl -fL --retry 3 --retry-delay 2 "$URL" -o "$OUT_FILE"; then
       GRIMMORY_JAR_ASSET="$ASSET"
       GRIMMORY_JAR_URL="$URL"
-      msg_ok "Downloaded release asset: ${ASSET}"
-      break
+      validate_grimmory_jar "$OUT_FILE"
+      msg_ok "Prebuilt Grimmory JAR ready (${GRIMMORY_JAR_ASSET})"
+      return 0
     fi
 
     rm -f "$OUT_FILE"
   done
 
-  if [[ ! -s "$OUT_FILE" ]]; then
-    msg_error "Failed to download a prebuilt Grimmory JAR for ${GRIMMORY_VERSION}. Tried: ${GRIMMORY_JAR_ASSET_CANDIDATES[*]}"
-    return 1
-  fi
-
-  SIZE_BYTES="$(stat -c '%s' "$OUT_FILE")"
-  if (( SIZE_BYTES < MIN_SIZE_BYTES )); then
-    msg_error "Downloaded file is too small to be the Grimmory application JAR (${SIZE_BYTES} bytes)"
-    return 1
-  fi
-
-  if command -v jar >/dev/null 2>&1; then
-    if ! jar tf "$OUT_FILE" >/dev/null 2>&1; then
-      msg_error "Downloaded file is not a valid JAR archive"
-      return 1
-    fi
-  else
-    msg_warn "jar command not found; skipping JAR archive validation"
-  fi
-
-  msg_ok "Prebuilt Grimmory JAR ready (${GRIMMORY_JAR_ASSET})"
+  msg_error "Failed to download a prebuilt Grimmory JAR for ${GRIMMORY_VERSION}. Tried: ${GRIMMORY_JAR_ASSET_CANDIDATES[*]}"
+  return 1
 }
 
 function ensure_grimmory_service_exists() {
@@ -293,8 +382,11 @@ SERVICE_EOF
 
 function update_script() {
   header_info
+
+  # Prebuilt JAR updates do not compile the frontend/backend inside the LXC,
+  # so avoid enforcing or prompting for build-sized CPU/RAM resources here.
+  # Keep the storage check to catch genuinely low disk space before replacing the JAR.
   check_container_storage
-  check_container_resources
 
   # Installation check intentionally remains bypassed for repair/update scenarios.
   # if [[ ! -d /opt/booklore && ! -d /opt/grimmory ]]; then
@@ -305,11 +397,11 @@ function update_script() {
   JAVA_VERSION="25"
   setup_java
   setup_mariadb
-  ensure_dependencies ffmpeg libarchive13
+  ensure_dependencies ffmpeg libarchive13 libarchive-dev
   setup_kepubify
 
   # Grimmory native archive support expects libarchive.so to resolve.
-  setup_libarchive_link
+  setup_libarchive_runtime
 
   local EXISTING_BOOKLORE_PORT
   local TMP_JAR
@@ -336,20 +428,23 @@ function update_script() {
     msg_ok "Migrated old environment variables"
   fi
 
-  msg_info "Backing up old installation"
+  msg_info "Backing up current installation"
   rm -rf /opt/grimmory_bak /opt/booklore_bak
-  if [[ -d /opt/booklore ]]; then
+  if [[ -d /opt/booklore && ! -d /opt/grimmory ]]; then
     mv /opt/booklore /opt/booklore_bak
   fi
   if [[ -d /opt/grimmory ]]; then
     cp -a /opt/grimmory /opt/grimmory_bak
   fi
-  msg_ok "Backed up old installation"
+  msg_ok "Backed up current installation"
 
   msg_info "Installing prebuilt Grimmory JAR (${GRIMMORY_VERSION})"
-  rm -rf /opt/grimmory
   mkdir -p /opt/grimmory/dist
-  install -m 0644 -T "$TMP_JAR" /opt/grimmory/dist/app.jar
+  if [[ -f /opt/grimmory/dist/app.jar ]]; then
+    cp -a /opt/grimmory/dist/app.jar /opt/grimmory/dist/app.jar.previous
+  fi
+  install -m 0644 -T "$TMP_JAR" /opt/grimmory/dist/app.jar.new
+  mv -f /opt/grimmory/dist/app.jar.new /opt/grimmory/dist/app.jar
   msg_ok "Installed prebuilt Grimmory JAR"
 
   if systemctl is-active --quiet nginx 2>/dev/null; then
@@ -364,16 +459,20 @@ function update_script() {
 
   ensure_grimmory_service_exists
 
-  JAVA_TOOL_OPTIONS="-XX:+UseShenandoahGC -XX:ShenandoahGCHeuristics=compact -XX:+UseCompactObjectHeaders -XX:MaxRAMPercentage=60.0 -XX:InitialRAMPercentage=8.0 -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/heapdump.hprof -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=48m -Xss512k -XX:CICompilerCount=2 -XX:+UnlockExperimentalVMOptions -XX:+UseStringDeduplication -XX:ShenandoahUncommitDelay=5000 -XX:ShenandoahGuaranteedGCInterval=30000 -XX:MaxDirectMemorySize=256m --enable-native-access=ALL-UNNAMED --enable-preview"
+  JAVA_TOOL_OPTIONS="-XX:+UseShenandoahGC -XX:ShenandoahGCHeuristics=compact -XX:+UseCompactObjectHeaders -XX:MaxRAMPercentage=60.0 -XX:InitialRAMPercentage=8.0 -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/heapdump.hprof -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=48m -Xss512k -XX:CICompilerCount=2 -XX:+UnlockExperimentalVMOptions -XX:+UseStringDeduplication -XX:ShenandoahUncommitDelay=5000 -XX:ShenandoahGuaranteedGCInterval=30000 -XX:MaxDirectMemorySize=256m"
 
   upsert_service_line /etc/systemd/system/grimmory.service '^EnvironmentFile=.*booklore_storage/\.env' 'EnvironmentFile=-/opt/booklore_storage/.env'
   SERVICE_APP_VERSION_LINE="Environment=\"APP_VERSION=${GRIMMORY_VERSION}\""
   SERVICE_APP_REVISION_LINE="Environment=\"APP_REVISION=${GRIMMORY_REVISION}\""
   SERVICE_JAVA_TOOL_OPTIONS_LINE="Environment=\"JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS}\""
+  SERVICE_JNA_LIBRARY_PATH_LINE="Environment=\"JNA_LIBRARY_PATH=${GRIMMORY_NATIVE_LIBRARY_PATH:-/usr/local/lib/grimmory}\""
+  SERVICE_LD_LIBRARY_PATH_LINE="Environment=\"LD_LIBRARY_PATH=${GRIMMORY_NATIVE_LIBRARY_PATH:-/usr/local/lib/grimmory}\""
 
   upsert_service_line /etc/systemd/system/grimmory.service '^Environment="?APP_VERSION=' "$SERVICE_APP_VERSION_LINE"
   upsert_service_line /etc/systemd/system/grimmory.service '^Environment="?APP_REVISION=' "$SERVICE_APP_REVISION_LINE"
   upsert_service_line /etc/systemd/system/grimmory.service '^Environment="?JAVA_TOOL_OPTIONS=' "$SERVICE_JAVA_TOOL_OPTIONS_LINE"
+  upsert_service_line /etc/systemd/system/grimmory.service '^Environment="?JNA_LIBRARY_PATH=' "$SERVICE_JNA_LIBRARY_PATH_LINE"
+  upsert_service_line /etc/systemd/system/grimmory.service '^Environment="?LD_LIBRARY_PATH=' "$SERVICE_LD_LIBRARY_PATH_LINE"
   upsert_service_line /etc/systemd/system/grimmory.service '^WorkingDirectory=' 'WorkingDirectory=/opt/grimmory/dist'
   upsert_service_line /etc/systemd/system/grimmory.service '^ExecStart=' 'ExecStart=/usr/bin/java --enable-native-access=ALL-UNNAMED --enable-preview -jar /opt/grimmory/dist/app.jar'
   systemctl daemon-reload
@@ -385,11 +484,25 @@ function update_script() {
   sleep 2
   if ! systemctl is-active --quiet grimmory.service; then
     journalctl -u grimmory.service -n 80 --no-pager || true
-    msg_error "Grimmory service failed to start. Backups were retained."
+    if [[ -d /opt/grimmory_bak ]]; then
+      msg_warn "New Grimmory service failed to start; rolling back previous /opt/grimmory"
+      systemctl stop grimmory.service >/dev/null 2>&1 || true
+      rm -rf /opt/grimmory
+      cp -a /opt/grimmory_bak /opt/grimmory
+      systemctl daemon-reload
+      systemctl start grimmory.service >/dev/null 2>&1 || true
+      if systemctl is-active --quiet grimmory.service; then
+        msg_error "Grimmory update failed; previous installation was restored and started. Backups were retained for review."
+      else
+        msg_error "Grimmory service failed to start, and rollback did not start cleanly. Backups were retained."
+      fi
+    else
+      msg_error "Grimmory service failed to start. No previous /opt/grimmory backup was available."
+    fi
     exit 1
   fi
 
-  rm -rf /opt/grimmory_bak /opt/booklore_bak "$TMP_JAR"
+  rm -rf /opt/grimmory_bak /opt/booklore_bak "$TMP_JAR" /opt/grimmory/dist/app.jar.previous
   msg_ok "Started Service"
   msg_ok "Updated successfully using prebuilt JAR!"
   exit
