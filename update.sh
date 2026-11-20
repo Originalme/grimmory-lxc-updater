@@ -84,12 +84,17 @@ function setup_libarchive_runtime() {
 true)"
   fi
 
-  for CANDIDATE in     /usr/lib/${MULTIARCH_DIR}/libarchive.so     
-/lib/${MULTIARCH_DIR}/libarchive.so     /usr/lib/*/libarchive.so     
-/lib/*/libarchive.so     /usr/lib/${MULTIARCH_DIR}/libarchive.so.13     
-/lib/${MULTIARCH_DIR}/libarchive.so.13     /usr/lib/*/libarchive.so.13     
-/lib/*/libarchive.so.13     /usr/lib/libarchive.so     
-/usr/lib/libarchive.so.13; do
+  for CANDIDATE in \
+    /usr/lib/${MULTIARCH_DIR}/libarchive.so \
+    /lib/${MULTIARCH_DIR}/libarchive.so \
+    /usr/lib/*/libarchive.so \
+    /lib/*/libarchive.so \
+    /usr/lib/${MULTIARCH_DIR}/libarchive.so.13 \
+    /lib/${MULTIARCH_DIR}/libarchive.so.13 \
+    /usr/lib/*/libarchive.so.13 \
+    /lib/*/libarchive.so.13 \
+    /usr/lib/libarchive.so \
+    /usr/lib/libarchive.so.13; do
     if [[ -e "$CANDIDATE" ]]; then
       LIBARCHIVE_TARGET="$CANDIDATE"
       break
@@ -490,8 +495,8 @@ tools/grimmory/releases/download/${GRIMMORY_VERSION}/${ASSET}"
 }
 
 function ensure_grimmory_service_exists() {
-  if [[ -f /etc/systemd/system/booklore.service && ! -f 
-/etc/systemd/system/grimmory.service ]]; then
+  if [[ -f /etc/systemd/system/booklore.service && \
+    ! -f /etc/systemd/system/grimmory.service ]]; then
     mv /etc/systemd/system/booklore.service /etc/systemd/system/grimmory.service
   fi
 
