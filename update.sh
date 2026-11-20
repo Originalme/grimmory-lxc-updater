@@ -107,9 +107,8 @@ true)"
   fi
 
   # Do not write to /usr/lib directly. Some unprivileged or hardened LXCs reject
-  # manual symlink creation there. Put Grimmory's compatibility link in a 
-private
-  # directory and expose it through ldconfig/JNA/LD_LIBRARY_PATH instead.
+  # manual symlink creation there. Put Grimmory's compatibility link in a
+  # private directory and expose it through ldconfig/JNA/LD_LIBRARY_PATH instead.
   mkdir -p "$GRIMMORY_LIB_DIR"
   rm -f "$GRIMMORY_LIB_DIR/libarchive.so"
 
@@ -525,12 +524,12 @@ function update_script() {
 
   # Prebuilt JAR updates do not compile the frontend/backend inside the LXC,
   # so avoid enforcing or prompting for build-sized CPU/RAM resources here.
-  # Keep the storage check to catch genuinely low disk space before replacing 
-the JAR.
+  # Keep the storage check to catch genuinely low disk space before replacing
+  # the JAR.
   check_container_storage
 
-  # Installation check intentionally remains bypassed for repair/update 
-scenarios.
+  # Installation check intentionally remains bypassed for repair/update
+  # scenarios.
   # if [[ ! -d /opt/booklore && ! -d /opt/grimmory ]]; then
   #   msg_error "No BookLore or ${APP} Installation Found!"
   #   exit
@@ -707,7 +706,7 @@ LIBRARY_PATH:-/usr/local/lib/grimmory}\""
       systemctl daemon-reload
       systemctl start grimmory.service >/dev/null 2>&1 || true
       if systemctl is-active --quiet grimmory.service; then
-        msg_error "Grimmory update failed; previous installation was restored 
+        msg_error "Grimmory update failed; previous installation was restored
 and started. Backups were retained for review."
       else
         msg_error "Grimmory service failed to start, and rollback did not start 
