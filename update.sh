@@ -2,7 +2,7 @@
 source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/core/main/core/build.func)
 # Copyright (c) 2021-2026 community-scripts ORG
 # Author: MickLesk (CanbiZ)
-# License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
+# License: MIT | https://raw.githubusercontent.com/community-scripts/core/main/LICENSE
 # Source: https://github.com/grimmory-tools/grimmory
 # Modified by dalenjohnson. Forked by databoy2k for Grimmory 3.x
 # Modified for Grimmory release JAR deployments inside LXC.
