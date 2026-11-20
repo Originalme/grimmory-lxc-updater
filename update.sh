@@ -22,6 +22,11 @@ var_os="${var_os:-debian}"
 var_version="${var_version:-13}"
 var_unprivileged="${var_unprivileged:-1}"
 
+# Keep Community-Scripts-generated update wrappers on the maintained DevScripts
+# repository. The legacy ProxmoxVE/ct path no longer contains grimmory.sh.
+export COMMUNITY_SCRIPTS_URL="https://raw.githubusercontent.com/community-scripts/DevScripts/main"
+export COMMUNITY_SCRIPTS_CORE_URL="https://raw.githubusercontent.com/community-scripts/core/main"
+
 header_info "$APP"
 variables
 color
